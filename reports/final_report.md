@@ -1,5 +1,8 @@
 # Day 10 Reliability Final Report
 
+- Name: Nhữ Gia Bách
+- MSSV: 2A202600248
+
 ## 1. Architecture summary
 
 Gateway flow: request enters gateway, cache checked first, then circuit breaker gates provider calls, then fallback provider, then static fallback if all providers fail.
