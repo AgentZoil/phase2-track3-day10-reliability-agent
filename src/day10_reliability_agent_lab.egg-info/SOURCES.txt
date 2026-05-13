@@ -5,6 +5,7 @@ src/day10_reliability_agent_lab.egg-info/SOURCES.txt
 src/day10_reliability_agent_lab.egg-info/dependency_links.txt
 src/day10_reliability_agent_lab.egg-info/requires.txt
 src/day10_reliability_agent_lab.egg-info/top_level.txt
+src/redis/__init__.py
 src/reliability_lab/__init__.py
 src/reliability_lab/cache.py
 src/reliability_lab/chaos.py
@@ -16,4 +17,5 @@ src/reliability_lab/providers.py
 tests/test_config.py
 tests/test_gateway_contract.py
 tests/test_metrics.py
+tests/test_redis_cache.py
 tests/test_todo_requirements.py

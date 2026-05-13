@@ -6,6 +6,8 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
+import numpy as np
+
 # ---------------------------------------------------------------------------
 # Shared utilities — use these in both ResponseCache and SharedRedisCache
 # ---------------------------------------------------------------------------
@@ -26,6 +28,31 @@ def _looks_like_false_hit(query: str, cached_key: str) -> bool:
     nums_q = set(re.findall(r"\b\d{4}\b", query))
     nums_c = set(re.findall(r"\b\d{4}\b", cached_key))
     return bool(nums_q and nums_c and nums_q != nums_c)
+
+
+def _normalized_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text.lower().strip())
+
+
+def _tokenize(text: str) -> set[str]:
+    return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+
+def _char_ngrams(text: str, n: int = 3) -> set[str]:
+    cleaned = re.sub(r"\s+", " ", text.lower().strip())
+    if len(cleaned) < n:
+        return {cleaned} if cleaned else set()
+    return {cleaned[i : i + n] for i in range(len(cleaned) - n + 1)}
+
+
+def _jaccard(left: set[str], right: set[str]) -> float:
+    if not left or not right:
+        return 0.0
+    return len(left & right) / len(left | right)
+
+
+def _false_hit_cutoff(threshold: float) -> float:
+    return max(0.4, threshold * 0.75)
 
 
 # ---------------------------------------------------------------------------
@@ -55,33 +82,60 @@ class ResponseCache:
         self._entries: list[CacheEntry] = []
 
     def get(self, query: str) -> tuple[str | None, float]:
+        if _is_uncacheable(query):
+            return None, 0.0
+
         best_value: str | None = None
         best_score = 0.0
+        best_key: str | None = None
         now = time.time()
         self._entries = [e for e in self._entries if now - e.created_at <= self.ttl_seconds]
         for entry in self._entries:
-            score = self.similarity(query, entry.key)
-            if score > best_score:
-                best_score = score
-                best_value = entry.value
-        if best_score >= self.similarity_threshold:
+            if _normalized_text(query) == _normalized_text(entry.key):
+                return entry.value, 1.0
+                score = self.similarity(query, entry.key)
+                if score > best_score:
+                    best_score = score
+                    best_value = entry.value
+                    best_key = entry.key
+        if best_value is not None and best_key is not None and _looks_like_false_hit(query, best_key):
+            if best_score >= _false_hit_cutoff(self.similarity_threshold):
+                return None, best_score
+        if best_score >= self.similarity_threshold and best_value is not None:
             return best_value, best_score
         return None, best_score
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
+        if _is_uncacheable(query):
+            return
         self._entries.append(CacheEntry(query, value, time.time(), metadata or {}))
 
     @staticmethod
     def similarity(a: str, b: str) -> float:
-        """Very small baseline similarity using token overlap.
+        """Deterministic similarity using token + character overlap.
 
         TODO(student): Improve with embeddings or a deterministic vectorizer.
         """
-        left = set(a.lower().split())
-        right = set(b.lower().split())
-        if not left or not right:
-            return 0.0
-        return len(left & right) / len(left | right)
+        if _normalized_text(a) == _normalized_text(b):
+            return 1.0
+
+        token_score = _jaccard(_tokenize(a), _tokenize(b))
+        left_ngrams = sorted(_char_ngrams(a, 3))
+        right_ngrams = sorted(_char_ngrams(b, 3))
+        if left_ngrams and right_ngrams:
+            vocab = sorted(set(left_ngrams) | set(right_ngrams))
+            left_vec = np.array([left_ngrams.count(term) for term in vocab], dtype=float)
+            right_vec = np.array([right_ngrams.count(term) for term in vocab], dtype=float)
+            denom = float(np.linalg.norm(left_vec) * np.linalg.norm(right_vec))
+            char_score = float(left_vec.dot(right_vec) / denom) if denom else 0.0
+        else:
+            char_score = 0.0
+
+        left_years = re.findall(r"\b\d{4}\b", a)
+        right_years = re.findall(r"\b\d{4}\b", b)
+        year_penalty = 0.0 if not left_years or not right_years or set(left_years) == set(right_years) else 0.25
+
+        return max(0.0, min(1.0, 0.65 * token_score + 0.35 * char_score - year_penalty))
 
 
 # ---------------------------------------------------------------------------
@@ -146,7 +200,41 @@ class SharedRedisCache:
         7. Before returning a match, check _looks_like_false_hit(); if true,
            append to self.false_hit_log and return (None, best_score)
         """
-        return None, 0.0
+        if _is_uncacheable(query):
+            return None, 0.0
+
+        try:
+            exact_key = f"{self.prefix}{self._query_hash(query)}"
+            exact = self._redis.hget(exact_key, "response")
+            if exact is not None:
+                return exact, 1.0
+
+            best_value: str | None = None
+            best_score = 0.0
+            best_query: str | None = None
+            for key in self._redis.scan_iter(f"{self.prefix}*"):
+                cached_query = self._redis.hget(key, "query")
+                cached_response = self._redis.hget(key, "response")
+                if not cached_query or cached_response is None:
+                    continue
+                if _normalized_text(query) == _normalized_text(cached_query):
+                    return cached_response, 1.0
+                score = ResponseCache.similarity(query, cached_query)
+                if score > best_score:
+                    best_score = score
+                    best_value = cached_response
+                    best_query = cached_query
+            if best_value is not None and best_query is not None and _looks_like_false_hit(query, best_query):
+                if best_score >= _false_hit_cutoff(self.similarity_threshold):
+                    self.false_hit_log.append(
+                        {"query": query, "cached_query": best_query, "score": best_score, "reason": "year_mismatch"}
+                    )
+                    return None, best_score
+            if best_value is not None and best_score >= self.similarity_threshold:
+                return best_value, best_score
+            return None, best_score
+        except Exception:
+            return None, 0.0
 
     def set(self, query: str, value: str, metadata: dict[str, str] | None = None) -> None:
         """Store a response in Redis with TTL.
@@ -157,7 +245,18 @@ class SharedRedisCache:
         3. self._redis.hset(key, mapping={"query": query, "response": value})
         4. self._redis.expire(key, self.ttl_seconds)
         """
-        pass
+        if _is_uncacheable(query):
+            return
+
+        try:
+            key = f"{self.prefix}{self._query_hash(query)}"
+            mapping = {"query": query, "response": value}
+            if metadata:
+                mapping.update({f"meta:{k}": v for k, v in metadata.items()})
+            self._redis.hset(key, mapping=mapping)
+            self._redis.expire(key, self.ttl_seconds)
+        except Exception:
+            return
 
     def flush(self) -> None:
         """Remove all entries with this cache prefix (for testing)."""

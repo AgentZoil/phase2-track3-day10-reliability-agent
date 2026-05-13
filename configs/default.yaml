@@ -4,7 +4,7 @@ providers:
     base_latency_ms: 180
     cost_per_1k_tokens: 0.01
   - name: backup
-    fail_rate: 0.05
+    fail_rate: 0.0
     base_latency_ms: 260
     cost_per_1k_tokens: 0.006
 circuit_breaker:
@@ -13,12 +13,12 @@ circuit_breaker:
   success_threshold: 1
 cache:
   enabled: true
-  backend: memory          # "memory" (default) or "redis" (requires docker compose up -d)
+  backend: redis          # "memory" or "redis" (shared cache via docker compose up -d)
   ttl_seconds: 300
   similarity_threshold: 0.92
   redis_url: "redis://localhost:6379/0"
 load_test:
-  requests: 100
+  requests: 200
 
 # Chaos scenarios: each overrides provider fail_rate for targeted testing.
 # TODO(student): Add more scenarios or tweak these.
@@ -33,4 +33,6 @@ scenarios:
       primary: 0.5
   - name: all_healthy
     description: "Baseline — both providers healthy"
-    provider_overrides: {}
+    provider_overrides:
+      primary: 0.0
+      backup: 0.0
